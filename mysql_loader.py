@@ -65,6 +65,105 @@ def banner():
     print()
 
 
+# ─── Discovered MySQL binary paths (populated by preflight) ──────────────────
+MYSQL_BINS = {"mysql": None, "mysqldump": None, "mysqladmin": None}
+
+
+def _find_mysql_binary(name):
+    """
+    Find a MySQL binary by name. Search order:
+      1. PATH  (shutil.which)
+      2. Common install directories per platform
+      3. Running mysqld process → derive bin/ from its path
+    Returns the full path or None.
+    """
+    # 1. PATH
+    found = shutil.which(name)
+    if found:
+        return found
+
+    # 2. Common install directories
+    sys_name = platform.system()
+    search_dirs = []
+
+    if sys_name == "Darwin":
+        search_dirs = [
+            "/usr/local/mysql/bin",                 # Official DMG installer
+            "/opt/homebrew/bin",                     # Homebrew Apple Silicon
+            "/usr/local/bin",                        # Homebrew Intel
+            "/opt/local/bin",                        # MacPorts
+            "/Applications/MAMP/Library/bin",        # MAMP
+            "/Applications/XAMPP/bin",               # XAMPP
+        ]
+        # Homebrew cellar (versioned)
+        cellar_dirs = ["/opt/homebrew/Cellar/mysql", "/usr/local/Cellar/mysql"]
+        for cellar in cellar_dirs:
+            if os.path.isdir(cellar):
+                for ver in sorted(os.listdir(cellar), reverse=True):
+                    search_dirs.append(os.path.join(cellar, ver, "bin"))
+        # Anaconda / Miniconda
+        for conda_root in [os.path.expanduser("~/anaconda3"), os.path.expanduser("~/miniconda3"),
+                           "/opt/anaconda3", "/opt/miniconda3"]:
+            if os.path.isdir(os.path.join(conda_root, "bin")):
+                search_dirs.append(os.path.join(conda_root, "bin"))
+
+    elif sys_name == "Linux":
+        search_dirs = [
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/local/bin",
+            "/usr/local/mysql/bin",                  # Tarball install
+            "/opt/mysql/bin",
+            "/snap/bin",
+        ]
+
+    elif sys_name == "Windows":
+        # Scan Program Files for MySQL Server
+        for pf in [os.environ.get("ProgramFiles", r"C:\Program Files"),
+                    os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]:
+            mysql_root = os.path.join(pf, "MySQL")
+            if os.path.isdir(mysql_root):
+                for entry in sorted(os.listdir(mysql_root), reverse=True):
+                    search_dirs.append(os.path.join(mysql_root, entry, "bin"))
+
+    for d in search_dirs:
+        candidate = os.path.join(d, name)
+        # On Windows, check .exe too
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        if sys_name == "Windows" and os.path.isfile(candidate + ".exe"):
+            return candidate + ".exe"
+
+    # 3. Detect from running mysqld process (macOS / Linux only)
+    if sys_name in ("Darwin", "Linux"):
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "args"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if "mysqld" in line and "/" in line:
+                    # Extract the binary path, then look in same dir
+                    parts = line.strip().split()
+                    for part in parts:
+                        if "/mysqld" in part:
+                            bin_dir = os.path.dirname(part)
+                            candidate = os.path.join(bin_dir, name)
+                            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                                return candidate
+                            break
+        except Exception:
+            pass
+
+    return None
+
+
+def _discover_mysql_binaries():
+    """Find mysql, mysqldump, and mysqladmin. Store in MYSQL_BINS."""
+    for name in MYSQL_BINS:
+        MYSQL_BINS[name] = _find_mysql_binary(name)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PRE-FLIGHT CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,19 +210,23 @@ def check_pip():
 
 
 def check_mysql_client():
-    mysql_bin = shutil.which("mysql")
+    mysql_bin = MYSQL_BINS["mysql"]
     if mysql_bin:
-        print(green("  ✓") + f" mysql client  →  {mysql_bin}")
+        on_path = shutil.which("mysql") == mysql_bin
+        label = mysql_bin if on_path else f"{mysql_bin}  {dim('(not on PATH — auto-detected)')}"
+        print(green("  ✓") + f" mysql client  →  {label}")
         return True
-    print(yellow("  ⚠") + " mysql client not found on PATH")
+    print(yellow("  ⚠") + " mysql client not found")
     _print_mysql_install_hint()
     return False
 
 
 def check_mysqldump():
-    dump_bin = shutil.which("mysqldump")
+    dump_bin = MYSQL_BINS["mysqldump"]
     if dump_bin:
-        print(green("  ✓") + f" mysqldump     →  {dump_bin}")
+        on_path = shutil.which("mysqldump") == dump_bin
+        label = dump_bin if on_path else f"{dump_bin}  {dim('(not on PATH — auto-detected)')}"
+        print(green("  ✓") + f" mysqldump     →  {label}")
         return True
     print(yellow("  ⚠") + " mysqldump not found  (dump will be unavailable)")
     _print_mysql_install_hint()
@@ -132,9 +235,22 @@ def check_mysqldump():
 
 def check_mysql_server():
     """Quick probe: is the MySQL server reachable on localhost?"""
-    mysqladmin = shutil.which("mysqladmin")
+    mysqladmin = MYSQL_BINS["mysqladmin"]
     if not mysqladmin:
-        return None  # can't check without the binary
+        # No mysqladmin binary, but check if we can detect a running process
+        if platform.system() in ("Darwin", "Linux"):
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", "mysqld"], capture_output=True, timeout=3,
+                )
+                if result.returncode == 0:
+                    print(green("  ✓") + " MySQL server is running  " + dim("(detected via process)"))
+                    return True
+            except Exception:
+                pass
+        print(yellow("  ⚠") + " Cannot verify MySQL server status (mysqladmin not found)")
+        return None
+
     result = subprocess.run(
         [mysqladmin, "ping", "-h", "127.0.0.1", "--connect-timeout=3"],
         capture_output=True, text=True,
@@ -150,6 +266,7 @@ def check_mysql_server():
     sys_name = platform.system()
     if sys_name == "Darwin":
         print(dim("    Start with:  brew services start mysql"))
+        print(dim("              or sudo /usr/local/mysql/support-files/mysql.server start"))
     elif sys_name == "Linux":
         print(dim("    Start with:  sudo systemctl start mysql"))
         print(dim("              or sudo service mysql start"))
@@ -268,6 +385,8 @@ def preflight():
     print(bold("\n── Pre-flight checks ──────────────────────────────────────"))
     check_python_version()
     check_python_packages()
+    print(dim("  Scanning for MySQL binaries..."))
+    _discover_mysql_binaries()
     mysql_ok = check_mysql_client()
     dump_ok  = check_mysqldump()
     check_mysql_server()
@@ -693,8 +812,9 @@ def run_dump(host, port, user, pwd, db_name, output_dir):
     ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
     dump_file = os.path.join(output_dir, f"{db_name}_{ts}.sql")
 
+    mysqldump_bin = MYSQL_BINS.get("mysqldump") or "mysqldump"
     cmd = [
-        "mysqldump",
+        mysqldump_bin,
         f"-u{user}",
         f"-p{pwd}",
         f"-h{host}",
