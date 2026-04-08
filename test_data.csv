@@ -1,0 +1,11 @@
+customer_id,full_name,email,subscription_type,start_date,monthly_charge,data_usage_gb,is_active
+1001,John Smith,john@example.com,Premium,15/01/2024,49.99,12.5,1
+1002,María García,maria@test.com,Basic,22/03/2024,19.99,3.2,1
+1003,李明,liming@demo.cn,Standard,01/06/2023,29.99,8.7,0
+1004,Björk Ólafsdóttir,bjork@nordic.is,Premium,10/11/2023,49.99,15.1,1
+1005,Ahmed Hassan,ahmed@mail.eg,Basic,05/08/2024,19.99,1.8,1
+1006,Nguyễn Văn A,nguyen@vn.test,Standard,28/02/2024,29.99,6.4,0
+1007,Sarah O'Connor,sarah@example.ie,Premium,12/04/2023,49.99,22.3,1
+1008,René Müller,rene@test.de,Basic,30/09/2024,19.99,2.1,1
+1009,Дмитрий Иванов,dmitry@test.ru,Standard,17/07/2023,29.99,9.9,0
+1010,Fatima Al-Rashid,fatima@demo.sa,Premium,01/12/2024,49.99,18.6,1

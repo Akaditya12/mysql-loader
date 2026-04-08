@@ -1,0 +1,953 @@
+#!/usr/bin/env python3
+"""
+mysql_loader.py
+─────────────────────────────────────────────────────────────────────────────
+Load a CSV / Excel file into MySQL and optionally export a .sql dump.
+
+Platform : macOS · Linux · Windows
+Python   : 3.8+
+─────────────────────────────────────────────────────────────────────────────
+"""
+
+import sys
+import os
+import re
+import subprocess
+import getpass
+import shutil
+import platform
+import time
+from datetime import datetime
+
+# ─── Terminal colours (graceful fallback on Windows without colorama) ─────────
+try:
+    import ctypes
+    if platform.system() == "Windows":
+        ctypes.windll.kernel32.SetConsoleMode(
+            ctypes.windll.kernel32.GetStdHandle(-11), 7
+        )
+    C = {
+        "reset": "\033[0m", "bold": "\033[1m",
+        "green": "\033[32m", "red": "\033[31m",
+        "yellow": "\033[33m", "cyan": "\033[36m",
+        "dim": "\033[2m",
+    }
+except Exception:
+    C = {k: "" for k in ("reset","bold","green","red","yellow","cyan","dim")}
+
+def green(s):  return f"{C['green']}{s}{C['reset']}"
+def red(s):    return f"{C['red']}{s}{C['reset']}"
+def yellow(s): return f"{C['yellow']}{s}{C['reset']}"
+def cyan(s):   return f"{C['cyan']}{s}{C['reset']}"
+def bold(s):   return f"{C['bold']}{s}{C['reset']}"
+def dim(s):    return f"{C['dim']}{s}{C['reset']}"
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+BATCH_SIZE   = 2000          # rows per INSERT batch
+REQUIRED_PY  = ["pandas", "mysql-connector-python", "openpyxl"]
+IMPORT_MAP   = {
+    "pandas":                 "pandas",
+    "mysql-connector-python": "mysql.connector",
+    "openpyxl":               "openpyxl",
+}
+SUPPORTED_EXT = (".csv", ".tsv", ".xlsx", ".xls")
+PIP_TIMEOUT  = 120           # seconds before pip install is killed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BANNER
+# ─────────────────────────────────────────────────────────────────────────────
+def banner():
+    print()
+    print(bold("╔══════════════════════════════════════════════════════════╗"))
+    print(bold("║") + cyan("      MySQL File Loader & Dumper  v2.0                  ") + bold("║"))
+    print(bold("║") + dim("      CSV / Excel  →  MySQL  →  .sql dump               ") + bold("║"))
+    print(bold("╚══════════════════════════════════════════════════════════╝"))
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRE-FLIGHT CHECKS
+# ─────────────────────────────────────────────────────────────────────────────
+def check_python_version():
+    if sys.version_info < (3, 8):
+        print(red("  ✗ Python 3.8+ required. You have: ") + sys.version)
+        sys.exit(1)
+    print(green("  ✓") + f" Python {sys.version.split()[0]}")
+
+
+def _in_virtualenv():
+    """Detect if running inside a virtualenv / venv / conda env."""
+    return (
+        sys.prefix != sys.base_prefix
+        or os.environ.get("VIRTUAL_ENV")
+        or os.environ.get("CONDA_DEFAULT_ENV")
+    )
+
+
+def check_pip():
+    """Verify pip is available. Returns True if usable, False otherwise."""
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "--version"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        ver_line = result.stdout.strip().split("\n")[0]
+        print(green("  ✓") + f" pip  →  {ver_line}")
+        return True
+
+    print(red("  ✗ pip is not installed"))
+    sys_name = platform.system()
+    print(dim("    Fix with one of:"))
+    if sys_name == "Darwin":
+        print(dim("      python3 -m ensurepip --upgrade"))
+        print(dim("      brew install python3"))
+    elif sys_name == "Linux":
+        print(dim("      python3 -m ensurepip --upgrade"))
+        print(dim("      sudo apt install python3-pip   (Debian/Ubuntu)"))
+        print(dim("      sudo yum install python3-pip   (RHEL/CentOS)"))
+    else:
+        print(dim("      python -m ensurepip --upgrade"))
+    return False
+
+
+def check_mysql_client():
+    mysql_bin = shutil.which("mysql")
+    if mysql_bin:
+        print(green("  ✓") + f" mysql client  →  {mysql_bin}")
+        return True
+    print(yellow("  ⚠") + " mysql client not found on PATH")
+    _print_mysql_install_hint()
+    return False
+
+
+def check_mysqldump():
+    dump_bin = shutil.which("mysqldump")
+    if dump_bin:
+        print(green("  ✓") + f" mysqldump     →  {dump_bin}")
+        return True
+    print(yellow("  ⚠") + " mysqldump not found  (dump will be unavailable)")
+    _print_mysql_install_hint()
+    return False
+
+
+def check_mysql_server():
+    """Quick probe: is the MySQL server reachable on localhost?"""
+    mysqladmin = shutil.which("mysqladmin")
+    if not mysqladmin:
+        return None  # can't check without the binary
+    result = subprocess.run(
+        [mysqladmin, "ping", "-h", "127.0.0.1", "--connect-timeout=3"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print(green("  ✓") + " MySQL server is running")
+        return True
+    # Access denied still means the server IS running
+    if "Access denied" in (result.stderr or ""):
+        print(green("  ✓") + " MySQL server is running  " + dim("(auth required)"))
+        return True
+    print(yellow("  ⚠") + " MySQL server is not responding on 127.0.0.1")
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        print(dim("    Start with:  brew services start mysql"))
+    elif sys_name == "Linux":
+        print(dim("    Start with:  sudo systemctl start mysql"))
+        print(dim("              or sudo service mysql start"))
+    else:
+        print(dim("    Start the MySQL service from Services panel or:"))
+        print(dim("      net start MySQL"))
+    return False
+
+
+def _print_mysql_install_hint():
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        print(dim("    Install:  brew install mysql"))
+    elif sys_name == "Linux":
+        print(dim("    Install:  sudo apt install mysql-server mysql-client  (Debian/Ubuntu)"))
+        print(dim("              sudo yum install mysql-server mysql         (RHEL/CentOS)"))
+    elif sys_name == "Windows":
+        print(dim("    Install:  https://dev.mysql.com/downloads/installer/"))
+
+
+def _get_pip_flags():
+    """Build the right pip install flags for the current environment."""
+    flags = []
+    if not _in_virtualenv() and platform.system() in ("Darwin", "Linux"):
+        flags.append("--break-system-packages")
+    return flags
+
+
+def install_python_packages(packages=None):
+    """Install packages via pip with timeout and visible error output."""
+    packages = packages or REQUIRED_PY
+    pip_cmd = [sys.executable, "-m", "pip", "install"] + _get_pip_flags() + packages
+
+    env_label = "virtualenv" if _in_virtualenv() else "system"
+    print(dim(f"    Installing into {env_label} Python: ") + ", ".join(packages))
+
+    try:
+        result = subprocess.run(
+            pip_cmd,
+            capture_output=True, text=True,
+            timeout=PIP_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        print(red(f"  ✗ pip timed out after {PIP_TIMEOUT}s"))
+        print(yellow("    Check your internet connection and try again."))
+        print(dim(f"    Or install manually:  pip install {' '.join(packages)}"))
+        return False
+
+    if result.returncode != 0:
+        print(red("  ✗ pip install failed:"))
+        # Show the last 10 lines of stderr (most useful part)
+        stderr_lines = (result.stderr or "").strip().splitlines()
+        for line in stderr_lines[-10:]:
+            print(red(f"    {line}"))
+        print()
+        print(dim(f"    Install manually:  pip install {' '.join(packages)}"))
+        return False
+
+    return True
+
+
+def _check_imports():
+    """Try importing each required package. Returns list of missing pip names."""
+    import importlib
+    missing = []
+    for pkg in REQUIRED_PY:
+        import_name = IMPORT_MAP.get(pkg, pkg)
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            missing.append(pkg)
+    return missing
+
+
+def check_python_packages():
+    """Check required packages, offer to install, and verify after install."""
+    missing = _check_imports()
+
+    if not missing:
+        print(green("  ✓") + f" Python packages  ({', '.join(REQUIRED_PY)})")
+        return True
+
+    print(yellow("  ⚠") + f" Missing Python packages: " + bold(", ".join(missing)))
+    answer = _prompt("  Install them now?", default="y")
+    if answer.lower() not in ("y", "yes", ""):
+        print(red("  ✗ Cannot continue without: ") + ", ".join(missing))
+        print(dim(f"    Install manually:  pip install {' '.join(missing)}"))
+        sys.exit(1)
+
+    # Check pip first
+    if not check_pip():
+        print(red("  ✗ Cannot install packages without pip. Fix pip first, then re-run."))
+        sys.exit(1)
+
+    # Attempt install
+    if not install_python_packages(missing):
+        sys.exit(1)
+
+    # VERIFY — re-check imports to confirm they actually work now
+    still_missing = _check_imports()
+    if still_missing:
+        print(red("  ✗ Install reported success but imports still fail:"))
+        for pkg in still_missing:
+            print(red(f"    - {pkg}"))
+        print()
+        print(yellow("    This can happen when pip installs to a different Python."))
+        print(dim(f"    Your Python: {sys.executable}"))
+        print(dim(f"    Try:  {sys.executable} -m pip install {' '.join(still_missing)}"))
+        sys.exit(1)
+
+    print(green("  ✓") + " Packages installed and verified")
+    return True
+
+
+def preflight():
+    print(bold("\n── Pre-flight checks ──────────────────────────────────────"))
+    check_python_version()
+    check_python_packages()
+    mysql_ok = check_mysql_client()
+    dump_ok  = check_mysqldump()
+    check_mysql_server()
+
+    if not mysql_ok:
+        print()
+        print(yellow("  MySQL client tools are required. Install them and re-run."))
+        ans = _prompt("  Continue anyway?", default="n")
+        if ans.lower() not in ("y", "yes"):
+            sys.exit(1)
+
+    print()
+    return mysql_ok, dump_ok
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROMPTS
+# ─────────────────────────────────────────────────────────────────────────────
+def _prompt(label, default=None, secret=False, required=False):
+    hint   = f" {dim(f'[{default}]')}" if default is not None else ""
+    prefix = f"  {cyan('→')} {label}{hint}: "
+    while True:
+        if secret:
+            val = getpass.getpass(prefix)
+        else:
+            val = input(prefix).strip()
+        # Strip surrounding quotes (drag-and-drop on macOS adds them)
+        val = val.strip("'\"")
+        if val:
+            return val
+        if default is not None:
+            return str(default)
+        if required:
+            print(red("    Value required, please try again."))
+        else:
+            return ""
+
+
+def ask_file_path():
+    print(bold("\n── Input file ─────────────────────────────────────────────"))
+    print(dim("  Supported: .csv  .tsv  .xlsx  .xls"))
+    print(dim("  Tip: drag & drop the file into the terminal\n"))
+    while True:
+        path = _prompt("File path", required=True)
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            print(red(f"    File not found: {path}"))
+            continue
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in SUPPORTED_EXT:
+            print(red(f"    Unsupported type '{ext}' — use {SUPPORTED_EXT}"))
+            continue
+        return path
+
+
+def ask_connection():
+    print(bold("\n── MySQL connection ────────────────────────────────────────"))
+    host = _prompt("Host",     default="127.0.0.1")
+    port = _prompt("Port",     default="3306")
+    user = _prompt("User",     default="root")
+    pwd  = _prompt("Password", secret=True)
+    return host, int(port), user, pwd
+
+
+def ask_db_table(filename, host=None, port=None, user=None, pwd=None):
+    base       = os.path.splitext(os.path.basename(filename))[0]
+    safe_base  = re.sub(r'[^a-z0-9]', '_', base.lower()).strip('_') or "import_db"
+    print(bold("\n── Database / table ────────────────────────────────────────"))
+
+    # Show existing databases if connection info is available
+    if host and pwd:
+        try:
+            import mysql.connector
+            tmp = mysql.connector.connect(host=host, port=port, user=user,
+                                          password=pwd, connection_timeout=5)
+            cur = tmp.cursor()
+            cur.execute(
+                "SELECT schema_name FROM information_schema.schemata "
+                "WHERE schema_name NOT IN "
+                "('information_schema','performance_schema','mysql','sys')"
+            )
+            dbs = [row[0] for row in cur.fetchall()]
+            cur.close()
+            tmp.close()
+            if dbs:
+                print(f"  {dim('Existing databases:')}  " + "  ".join(cyan(d) for d in dbs))
+        except Exception:
+            pass
+
+    db    = _prompt("Database name", default=safe_base)
+    table = _prompt("Table name",    default=safe_base)
+    return db, table
+
+
+def ask_mode(dump_available):
+    print(bold("\n── What would you like to do? ──────────────────────────────"))
+    print(f"  {cyan('1')}  Load file into MySQL only")
+    if dump_available:
+        print(f"  {cyan('2')}  Load file into MySQL  +  take .sql dump")
+        print(f"  {cyan('3')}  Take .sql dump of an existing database (no file needed)")
+    else:
+        print(dim("  2  Load + Dump  (mysqldump not available)"))
+        print(dim("  3  Dump only    (mysqldump not available)"))
+    print()
+    while True:
+        choice = _prompt("Choice", default="1" if not dump_available else "2")
+        if choice in ("1", "2", "3"):
+            if choice in ("2", "3") and not dump_available:
+                print(yellow("    mysqldump is not installed — only option 1 is available."))
+                choice = "1"
+            return choice
+        print(red("    Enter 1, 2, or 3"))
+
+
+def ask_dump_output_dir(default_dir):
+    path = _prompt("Dump output directory", default=default_dir)
+    path = os.path.expanduser(path)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE READING
+# ─────────────────────────────────────────────────────────────────────────────
+def read_file(path):
+    """
+    Read a CSV/TSV/Excel file. For Excel files with multiple sheets,
+    returns a list of (sheet_name, DataFrame) tuples.
+    For CSV/TSV returns a single-item list: [("filename", DataFrame)].
+    """
+    import pandas as pd
+    ext = os.path.splitext(path)[1].lower()
+    size_mb = os.path.getsize(path) / 1_048_576
+    print(f"\n  {dim('File size:')} {size_mb:.1f} MB")
+
+    if ext in (".csv", ".tsv"):
+        sep = "\t" if ext == ".tsv" else ","
+        label = "TSV" if ext == ".tsv" else "CSV"
+        for enc in ("utf-8", "latin-1", "cp1252"):
+            try:
+                df = pd.read_csv(path, sep=sep, encoding=enc, low_memory=False)
+                print(f"  {dim('Format:')}   {label}  {dim('Encoding:')} {enc}")
+                return [df]
+            except UnicodeDecodeError:
+                continue
+        print(red(f"✗ Could not decode {label}. Tried utf-8, latin-1, cp1252."))
+        sys.exit(1)
+    else:
+        # Excel — check for multiple sheets
+        xls = pd.ExcelFile(path, engine="openpyxl")
+        sheet_names = xls.sheet_names
+
+        if len(sheet_names) == 1:
+            df = pd.read_excel(xls, sheet_name=sheet_names[0])
+            print(f"  {dim('Format:')}   Excel  {dim('Sheet:')} {sheet_names[0]}")
+            return [df]
+
+        # Multiple sheets found — let user choose
+        print(f"  {dim('Format:')}   Excel  {dim('Sheets found:')} {len(sheet_names)}")
+        print()
+        for i, name in enumerate(sheet_names, 1):
+            # Quick row count peek
+            df_peek = pd.read_excel(xls, sheet_name=name, nrows=0)
+            col_count = len(df_peek.columns)
+            print(f"    {cyan(str(i))}  {name}  {dim(f'({col_count} columns)')}")
+        print(f"    {cyan('A')}  All sheets")
+        print()
+
+        choice = _prompt("  Which sheets to load? (comma-separated numbers, or A for all)", default="A")
+
+        if choice.upper() == "A":
+            selected = sheet_names
+        else:
+            indices = []
+            for part in choice.split(","):
+                part = part.strip()
+                if part.isdigit() and 1 <= int(part) <= len(sheet_names):
+                    indices.append(int(part) - 1)
+                else:
+                    print(yellow(f"    Skipping invalid choice: {part}"))
+            selected = [sheet_names[i] for i in indices]
+            if not selected:
+                print(yellow("    No valid sheets selected, loading all."))
+                selected = sheet_names
+
+        results = []
+        for name in selected:
+            df = pd.read_excel(xls, sheet_name=name)
+            print(f"  {green('✓')} Sheet {bold(name)}: {len(df):,} rows × {len(df.columns)} columns")
+            results.append((name, df))
+        return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COLUMN / SCHEMA HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def sanitize_col(col):
+    col = str(col).strip().lower()
+    col = re.sub(r'[^a-z0-9_]', '', col)
+    col = re.sub(r'_+', '_', col).strip('_')
+    return col or "col_unnamed"
+
+
+def col_to_sql_type(series):
+    import pandas as pd
+    dtype = str(series.dtype)
+    if "datetime" in dtype:
+        return "DATETIME"
+    if "int" in dtype:
+        return "BIGINT"
+    if "float" in dtype:
+        return "DOUBLE"
+    max_len = series.dropna().astype(str).str.len().max()
+    max_len = int(max_len) if (max_len == max_len) else 255
+    return f"VARCHAR({min(max_len + 30, 65535)})"
+
+
+def preview_dataframe(df, original_cols):
+    import pandas as pd
+    print(f"\n  {green('✓')} {len(df):,} rows  ×  {len(df.columns)} columns detected")
+    print(f"\n  {bold('Column map:')}")
+    print(f"  {'#':<4} {'Original name':<30} {'MySQL name':<30} {'Type'}")
+    print(f"  {dim('─'*80)}")
+    for i, (orig, new) in enumerate(zip(original_cols, df.columns), 1):
+        sql_type = col_to_sql_type(df[new])
+        changed  = yellow(" ← renamed") if orig != new else ""
+        print(f"  {dim(str(i)):<4} {dim(orig):<30} {cyan(new):<30} {dim(sql_type)}{changed}")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MYSQL OPERATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+def connect_mysql(host, port, user, pwd, db=None, retry_password=False):
+    """
+    Connect to MySQL. Returns (connection, password) tuple.
+    password is returned so callers get the corrected value after retries.
+    Returns (None, pwd) on failure.
+    """
+    import mysql.connector
+    kwargs = dict(host=host, port=port, user=user, password=pwd,
+                  connection_timeout=10)
+    if db:
+        kwargs["database"] = db
+
+    max_attempts = 3 if retry_password else 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            conn = mysql.connector.connect(**kwargs)
+            return conn, kwargs["password"]
+        except mysql.connector.Error as e:
+            code = e.errno if hasattr(e, 'errno') else None
+
+            if code == 2003:  # Can't connect to server
+                print(red(f"  ✗ MySQL server is not reachable at {host}:{port}"))
+                sys_name = platform.system()
+                if sys_name == "Darwin":
+                    print(dim("    Start with:  brew services start mysql"))
+                elif sys_name == "Linux":
+                    print(dim("    Start with:  sudo systemctl start mysql"))
+                else:
+                    print(dim("    Start the MySQL service and try again."))
+                return None, pwd
+
+            elif code == 1045:  # Access denied
+                if attempt < max_attempts:
+                    print(yellow(f"  ✗ Wrong password for '{user}'@'{host}'  (attempt {attempt}/{max_attempts})"))
+                    kwargs["password"] = getpass.getpass(f"  {cyan('→')} Re-enter password: ")
+                    continue
+                else:
+                    print(red(f"  ✗ Access denied for '{user}'@'{host}' after {max_attempts} attempts"))
+                    print(dim(f"    Check your MySQL credentials and try again."))
+                    return None, pwd
+
+            elif code == 2005:  # Unknown host
+                print(red(f"  ✗ Cannot resolve host: {host}"))
+                print(dim(f"    Check the hostname and try again."))
+                return None, pwd
+
+            else:
+                print(red(f"  ✗ MySQL error ({code}): {e}"))
+                return None, pwd
+    return None, pwd
+
+
+def setup_database(conn, db_name, table_name, df):
+    import pandas as pd
+    cur = conn.cursor()
+
+    # Check if database already exists
+    cur.execute(
+        "SELECT schema_name FROM information_schema.schemata "
+        "WHERE schema_name = %s", (db_name,)
+    )
+    db_exists = cur.fetchone() is not None
+
+    if db_exists:
+        print(f"\n  {yellow('⚠')} Database {bold(db_name)} already exists")
+
+        # Show existing tables
+        cur.execute(f"USE `{db_name}`")
+        cur.execute("SHOW TABLES")
+        existing_tables = [row[0] for row in cur.fetchall()]
+        if existing_tables:
+            print(f"  {dim('Existing tables:')}  " + "  ".join(cyan(t) for t in existing_tables))
+
+        ans = _prompt("  Use existing database? (yes = add table, no = recreate from scratch)", default="yes")
+        if ans.lower() not in ("y", "yes"):
+            cur.execute(f"DROP DATABASE `{db_name}`")
+            cur.execute(
+                f"CREATE DATABASE `{db_name}` "
+                f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+            cur.execute(f"USE `{db_name}`")
+            print(f"  {green('✓')} Database {bold(db_name)} recreated (clean)")
+        else:
+            print(f"  {green('✓')} Using existing database {bold(db_name)}")
+
+            # Check if table name conflicts
+            if table_name in existing_tables:
+                # Show existing row count
+                cur.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+                existing_count = cur.fetchone()[0]
+                print(f"  {yellow('⚠')} Table {bold(table_name)} already exists  ({existing_count:,} rows)")
+                print(f"    {cyan('1')}  Append — add rows to existing table (keep current data)")
+                print(f"    {cyan('2')}  Overwrite — drop table & recreate from scratch")
+                print(f"    {cyan('3')}  New name — create a different table")
+                tbl_ans = _prompt("  Choice", default="1")
+
+                if tbl_ans == "1":
+                    # Append mode: skip CREATE TABLE, just insert later
+                    conn.commit()
+                    cur.close()
+                    print(f"  {green('✓')} Will append to {bold(table_name)}  ({existing_count:,} existing rows kept)")
+                    return None, table_name
+
+                elif tbl_ans == "2":
+                    cur.execute(f"DROP TABLE `{table_name}`")
+                    print(f"  {dim('Dropped old table')} {table_name}")
+
+                else:
+                    while table_name in existing_tables:
+                        table_name = _prompt("  New table name", required=True)
+                        if table_name in existing_tables:
+                            print(yellow(f"    '{table_name}' also exists. Try another name."))
+                    print(f"  {green('✓')} Will create table {bold(table_name)}")
+    else:
+        cur.execute(
+            f"CREATE DATABASE `{db_name}` "
+            f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        )
+        cur.execute(f"USE `{db_name}`")
+        print(f"\n  {green('✓')} Database {bold(db_name)} created")
+
+    # Create the table
+    col_defs = [f"  `{col}` {col_to_sql_type(df[col])}" for col in df.columns]
+    create_sql = (
+        f"CREATE TABLE `{table_name}` (\n"
+        + ",\n".join(col_defs)
+        + "\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+    )
+    cur.execute(create_sql)
+    conn.commit()
+    cur.close()
+
+    print(f"  {green('✓')} Table    {bold(table_name)} created")
+    print(f"\n  {dim('DDL preview:')}")
+    for line in create_sql.splitlines():
+        print(f"  {dim(line)}")
+    return create_sql, table_name
+
+
+def insert_rows(conn, db_name, table_name, df):
+    import pandas as pd
+    cur = conn.cursor()
+    cur.execute(f"USE `{db_name}`")
+
+    cols_esc    = ", ".join(f"`{c}`" for c in df.columns)
+    placeholders = ", ".join(["%s"] * len(df.columns))
+    insert_sql  = f"INSERT INTO `{table_name}` ({cols_esc}) VALUES ({placeholders})"
+
+    rows = [
+        tuple(None if (hasattr(v, '__float__') and v != v) or
+              (hasattr(pd, 'isna') and pd.isna(v)) else v
+              for v in row)
+        for row in df.itertuples(index=False)
+    ]
+
+    total     = len(rows)
+    t_start   = time.time()
+    inserted  = 0
+
+    print()
+    for i in range(0, total, BATCH_SIZE):
+        batch    = rows[i : i + BATCH_SIZE]
+        cur.executemany(insert_sql, batch)
+        conn.commit()
+        inserted = min(i + BATCH_SIZE, total)
+        elapsed  = time.time() - t_start
+        rps      = int(inserted / elapsed) if elapsed > 0 else 0
+        pct      = int(inserted / total * 100)
+        bar      = (green("█") * (pct // 5)).ljust(20 + len(C["green"]) + len(C["reset"]))
+        eta      = int((total - inserted) / rps) if rps > 0 else 0
+        eta_str  = f"ETA {eta}s" if eta > 0 else "done"
+        print(
+            f"  [{bar}] {pct:>3}%  {inserted:,}/{total:,}  "
+            f"{dim(str(rps) + ' rows/s')}  {dim(eta_str)}",
+            end="\r"
+        )
+
+    cur.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+    count = cur.fetchone()[0]
+    elapsed = time.time() - t_start
+    print(
+        f"  [{green('█' * 20)}] 100%  {count:,}/{total:,}  "
+        f"{dim(str(int(count/elapsed)) + ' rows/s')}  {green('done')}    "
+    )
+    cur.close()
+    return count
+
+
+def run_dump(host, port, user, pwd, db_name, output_dir):
+    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dump_file = os.path.join(output_dir, f"{db_name}_{ts}.sql")
+
+    cmd = [
+        "mysqldump",
+        f"-u{user}",
+        f"-p{pwd}",
+        f"-h{host}",
+        f"-P{str(port)}",
+        "--no-tablespaces",
+        "--result-file", dump_file,
+        db_name,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        # mysqldump often prints warnings even on success
+        if "Warning" in stderr or "warning" in stderr:
+            print(yellow(f"  ⚠  mysqldump warning: {stderr}"))
+        else:
+            print(red(f"  ✗  mysqldump error: {stderr}"))
+            return None
+
+    if not os.path.isfile(dump_file):
+        print(red("  ✗  Dump file was not created."))
+        return None
+
+    size_kb = os.path.getsize(dump_file) // 1024
+    print(f"  {green('✓')} Dump saved  →  {bold(dump_file)}  {dim(f'({size_kb:,} KB)')}")
+    return dump_file
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIRM SCREEN
+# ─────────────────────────────────────────────────────────────────────────────
+def confirm_summary(cfg):
+    print(bold("\n── Summary — review before running ────────────────────────"))
+    rows = [
+        ("File",      cfg.get("file", "—")),
+        ("Rows",      cfg.get("rows", "—")),
+        ("Columns",   cfg.get("cols", "—")),
+        ("Database",  cfg.get("db",   "—")),
+        ("Table",     cfg.get("table","—")),
+        ("Host",      f"{cfg.get('host')}:{cfg.get('port')}"),
+        ("User",      cfg.get("user", "—")),
+        ("Mode",      cfg.get("mode", "—")),
+    ]
+    if cfg.get("dump_dir"):
+        rows.append(("Dump dir", cfg["dump_dir"]))
+    for k, v in rows:
+        print(f"  {cyan(k+':'): <18} {v}")
+
+    print()
+    ans = _prompt("Proceed? (yes/no)", default="yes")
+    return ans.lower() in ("y", "yes")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DUMP-ONLY FLOW (no file load)
+# ─────────────────────────────────────────────────────────────────────────────
+def flow_dump_only(host, port, user, pwd, dump_available):
+    if not dump_available:
+        print(red("✗ mysqldump is not installed. Cannot take a dump."))
+        sys.exit(1)
+
+    print(bold("\n── Dump an existing database ───────────────────────────────"))
+    # List available databases
+    conn, _ = connect_mysql(host, port, user, pwd)
+    if not conn:
+        sys.exit(1)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT schema_name FROM information_schema.schemata "
+        "WHERE schema_name NOT IN "
+        "('information_schema','performance_schema','mysql','sys')"
+    )
+    dbs = [row[0] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    if dbs:
+        print(f"  {dim('Available databases:')}  " + "  ".join(cyan(d) for d in dbs))
+    else:
+        print(yellow("  No user databases found."))
+
+    db_name    = _prompt("Database to dump", required=True)
+    dump_dir   = ask_dump_output_dir(os.path.expanduser("~"))
+
+    print(bold("\n── Taking dump ─────────────────────────────────────────────"))
+    dump_file  = run_dump(host, port, user, pwd, db_name, dump_dir)
+    return dump_file
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    banner()
+
+    # 0. --check flag: run preflight only
+    if len(sys.argv) > 1 and sys.argv[1] in ("--check", "-c"):
+        preflight()
+        print(green("  Environment check complete.\n"))
+        return
+
+    # 1. Pre-flight (installs packages if missing, so import pandas after this)
+    _, dump_available = preflight()
+    import pandas as pd
+
+    # 2. Mode selection (before asking for file, so dump-only skips file prompt)
+    mode = ask_mode(dump_available)
+
+    # 3. Connection details (needed for all modes)
+    host, port, user, pwd = ask_connection()
+
+    # 4. Quick connectivity test (with password retry on typo)
+    print(f"\n  {dim('Testing connection...')}")
+    test_conn, pwd = connect_mysql(host, port, user, pwd, retry_password=True)
+    if not test_conn:
+        sys.exit(1)
+    test_conn.close()
+    print(green("  ✓ Connected to MySQL"))
+
+    # ── DUMP ONLY ─────────────────────────────────────────────────────────────
+    if mode == "3":
+        dump_file = flow_dump_only(host, port, user, pwd, dump_available)
+        print(bold(f"\n{'═'*60}"))
+        if dump_file:
+            print(green("  ✅  Dump complete!") + f"  →  {bold(dump_file)}")
+        else:
+            print(red("  ✗  Dump failed."))
+        print(bold(f"{'═'*60}\n"))
+        return
+
+    # ── LOAD (modes 1 & 2) ────────────────────────────────────────────────────
+    loaded_tables = []   # track all tables loaded in this session
+    db_name       = None
+    dump_dir      = None
+    file_number   = 0
+
+    while True:
+        file_number += 1
+        if file_number > 1:
+            print(bold(f"\n── File #{file_number} ──────────────────────────────────────────"))
+
+        file_path = ask_file_path()
+
+        # DB name: ask on first file, reuse after that
+        if db_name is None:
+            db_name, _ = ask_db_table(file_path, host, port, user, pwd)
+            if mode == "2":
+                dump_dir = ask_dump_output_dir(os.path.dirname(os.path.abspath(file_path)))
+
+        # Read file (may return multiple sheets for Excel)
+        print(bold("\n── Reading file ────────────────────────────────────────────"))
+        sheets = read_file(file_path)
+
+        # Normalize: ensure every item is (sheet_name, df)
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        base_safe = re.sub(r'[^a-z0-9]', '_', base_name.lower()).strip('_') or "import_table"
+        normalized = []
+        for item in sheets:
+            if isinstance(item, tuple):
+                sheet_name, df = item
+                safe_sheet = re.sub(r'[^a-z0-9]', '_', sheet_name.lower()).strip('_') or "sheet"
+                normalized.append((safe_sheet, df))
+            else:
+                normalized.append((base_safe, item))
+
+        # Process each sheet/dataframe
+        for sheet_idx, (default_table, df) in enumerate(normalized):
+            if len(normalized) > 1:
+                print(bold(f"\n── Sheet {sheet_idx+1}/{len(normalized)}: {cyan(default_table)} ────────────────────────"))
+
+            # Table name prompt
+            if len(normalized) == 1 and file_number == 1:
+                # First file, single sheet — use the name from ask_db_table
+                print(bold(f"\n── Table name (into database: {cyan(db_name)}) ───────────────────"))
+                table_name = _prompt("Table name", default=default_table)
+            else:
+                print(bold(f"\n── Table name (into database: {cyan(db_name)}) ───────────────────"))
+                table_name = _prompt("Table name", default=default_table)
+
+            original_cols = list(df.columns)
+            df.columns    = [sanitize_col(c) for c in df.columns]
+
+            for col in df.columns:
+                if any(kw in col for kw in ("time", "date", "created", "updated")):
+                    df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+
+            preview_dataframe(df, original_cols)
+
+            # Confirm
+            mode_label = {"1": "Load only", "2": "Load + Dump"}[mode]
+            cfg = dict(
+                file  = os.path.basename(file_path),
+                rows  = f"{len(df):,}",
+                cols  = str(len(df.columns)),
+                db    = db_name,
+                table = table_name,
+                host  = host,
+                port  = port,
+                user  = user,
+                mode  = mode_label,
+                dump_dir = dump_dir,
+            )
+            if len(normalized) > 1:
+                cfg["sheet"] = default_table
+            if not confirm_summary(cfg):
+                print(yellow("  Skipped."))
+                continue
+
+            # Setup DB & insert
+            print(bold("\n── Setting up database ─────────────────────────────────────"))
+            conn, _ = connect_mysql(host, port, user, pwd)
+            if not conn:
+                sys.exit(1)
+
+            _, table_name = setup_database(conn, db_name, table_name, df)
+
+            print(bold("\n── Inserting rows ──────────────────────────────────────────"))
+            count = insert_rows(conn, db_name, table_name, df)
+            conn.close()
+            print(f"\n  {green('✓')} {count:,} rows loaded into {bold(db_name)}.{bold(table_name)}")
+            loaded_tables.append((table_name, count))
+
+        # Ask to load another file
+        print()
+        again = _prompt("Load another file into the same database?", default="no")
+        if again.lower() not in ("y", "yes"):
+            break
+
+    # ── Dump (mode 2) — once at the end, covers all tables ────────────────
+    dump_file = None
+    if mode == "2" and loaded_tables:
+        print(bold("\n── Taking SQL dump ─────────────────────────────────────────"))
+        dump_file = run_dump(host, port, user, pwd, db_name, dump_dir)
+
+    # ── Final summary ─────────────────────────────────────────────────────
+    if not loaded_tables:
+        print(yellow("\n  No files were loaded.\n"))
+        return
+
+    total_rows = sum(c for _, c in loaded_tables)
+    print(bold(f"\n{'═'*60}"))
+    print(green("  ✅  All done!"))
+    print(f"  {cyan('Database:  ')}  {db_name}")
+    for tbl, cnt in loaded_tables:
+        print(f"  {cyan('  table:')}    {tbl}  ({cnt:,} rows)")
+    print(f"  {cyan('Total rows:')}  {total_rows:,}")
+    if dump_file:
+        print(f"  {cyan('SQL dump:  ')}  {dump_file}")
+    print(bold(f"{'═'*60}\n"))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n\n{yellow('  Interrupted by user.')}\n")
+        sys.exit(0)
