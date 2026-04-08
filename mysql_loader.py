@@ -846,6 +846,11 @@ def run_dump(host, port, user, pwd, db_name, output_dir):
 # CONFIRM SCREEN
 # ─────────────────────────────────────────────────────────────────────────────
 def confirm_summary(cfg):
+    host_str = f"{cfg.get('host')}:{cfg.get('port')}"
+    is_remote = cfg.get("host") not in ("127.0.0.1", "localhost", "::1")
+    if is_remote:
+        host_str = yellow(f"{host_str}  ⚠ REMOTE SERVER")
+
     print(bold("\n── Summary — review before running ────────────────────────"))
     rows = [
         ("File",      cfg.get("file", "—")),
@@ -853,7 +858,7 @@ def confirm_summary(cfg):
         ("Columns",   cfg.get("cols", "—")),
         ("Database",  cfg.get("db",   "—")),
         ("Table",     cfg.get("table","—")),
-        ("Host",      f"{cfg.get('host')}:{cfg.get('port')}"),
+        ("Host",      host_str),
         ("User",      cfg.get("user", "—")),
         ("Mode",      cfg.get("mode", "—")),
     ]
@@ -925,13 +930,26 @@ def main():
     # 3. Connection details (needed for all modes)
     host, port, user, pwd = ask_connection()
 
-    # 4. Quick connectivity test (with password retry on typo)
+    # 4. Remote server warning
+    is_remote = host not in ("127.0.0.1", "localhost", "::1")
+    if is_remote:
+        print()
+        print(yellow(f"  ⚠  You are connecting to a REMOTE server: {bold(host)}"))
+        print(dim("    • All operations (create DB, drop table, insert) will run on this server"))
+        print(dim("    • Make sure you have the right permissions"))
+        print(dim("    • Double-check the database name before confirming"))
+        confirm = _prompt("  Continue with remote server?", default="yes")
+        if confirm.lower() not in ("y", "yes"):
+            print(yellow("  Aborted."))
+            return
+
+    # 5. Quick connectivity test (with password retry on typo)
     print(f"\n  {dim('Testing connection...')}")
     test_conn, pwd = connect_mysql(host, port, user, pwd, retry_password=True)
     if not test_conn:
         sys.exit(1)
     test_conn.close()
-    print(green("  ✓ Connected to MySQL"))
+    print(green("  ✓ Connected to MySQL") + (f"  ({host})" if is_remote else ""))
 
     # ── DUMP ONLY ─────────────────────────────────────────────────────────────
     if mode == "3":
@@ -947,6 +965,7 @@ def main():
     # ── LOAD (modes 1 & 2) ────────────────────────────────────────────────────
     loaded_tables = []   # track all tables loaded in this session
     db_name       = None
+    first_table   = None  # table name from ask_db_table (used for first file)
     dump_dir      = None
     file_number   = 0
 
@@ -959,7 +978,7 @@ def main():
 
         # DB name: ask on first file, reuse after that
         if db_name is None:
-            db_name, _ = ask_db_table(file_path, host, port, user, pwd)
+            db_name, first_table = ask_db_table(file_path, host, port, user, pwd)
             if mode == "2":
                 dump_dir = ask_dump_output_dir(os.path.dirname(os.path.abspath(file_path)))
 
@@ -985,10 +1004,10 @@ def main():
                 print(bold(f"\n── Sheet {sheet_idx+1}/{len(normalized)}: {cyan(default_table)} ────────────────────────"))
 
             # Table name prompt
-            if len(normalized) == 1 and file_number == 1:
-                # First file, single sheet — use the name from ask_db_table
-                print(bold(f"\n── Table name (into database: {cyan(db_name)}) ───────────────────"))
-                table_name = _prompt("Table name", default=default_table)
+            if len(normalized) == 1 and file_number == 1 and first_table:
+                # First file, single sheet — already asked in ask_db_table
+                table_name = first_table
+                first_table = None  # consumed
             else:
                 print(bold(f"\n── Table name (into database: {cyan(db_name)}) ───────────────────"))
                 table_name = _prompt("Table name", default=default_table)
@@ -996,9 +1015,12 @@ def main():
             original_cols = list(df.columns)
             df.columns    = [sanitize_col(c) for c in df.columns]
 
+            import warnings
             for col in df.columns:
                 if any(kw in col for kw in ("time", "date", "created", "updated")):
-                    df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
 
             preview_dataframe(df, original_cols)
 
