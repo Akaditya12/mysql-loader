@@ -17,6 +17,7 @@ import getpass
 import shutil
 import platform
 import time
+import gzip
 from datetime import datetime
 
 # ─── Terminal colours (graceful fallback on Windows without colorama) ─────────
@@ -41,6 +42,14 @@ def yellow(s): return f"{C['yellow']}{s}{C['reset']}"
 def cyan(s):   return f"{C['cyan']}{s}{C['reset']}"
 def bold(s):   return f"{C['bold']}{s}{C['reset']}"
 def dim(s):    return f"{C['dim']}{s}{C['reset']}"
+
+def _format_size(n):
+    """Convert bytes to human-readable size."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 BATCH_SIZE   = 2000          # rows per INSERT batch
@@ -481,24 +490,54 @@ def ask_db_table(filename, host=None, port=None, user=None, pwd=None):
     return db, table
 
 
-def ask_mode(dump_available):
+def ask_mode(dump_available, is_remote=False):
     print(bold("\n── What would you like to do? ──────────────────────────────"))
     print(f"  {cyan('1')}  Load file into MySQL only")
     if dump_available:
         print(f"  {cyan('2')}  Load file into MySQL  +  take .sql dump")
         print(f"  {cyan('3')}  Take .sql dump of an existing database (no file needed)")
+        remote_hint = f"  {yellow('← recommended for remote')}" if is_remote else ""
+        print(f"  {cyan('4')}  Backup databases (selective, compressed .sql.gz){remote_hint}")
     else:
         print(dim("  2  Load + Dump  (mysqldump not available)"))
         print(dim("  3  Dump only    (mysqldump not available)"))
+        print(dim("  4  Backup       (mysqldump not available)"))
     print()
+    default = "4" if is_remote and dump_available else ("2" if dump_available else "1")
     while True:
-        choice = _prompt("Choice", default="1" if not dump_available else "2")
-        if choice in ("1", "2", "3"):
-            if choice in ("2", "3") and not dump_available:
+        choice = _prompt("Choice", default=default)
+        if choice in ("1", "2", "3", "4"):
+            if choice in ("2", "3", "4") and not dump_available:
                 print(yellow("    mysqldump is not installed — only option 1 is available."))
                 choice = "1"
             return choice
-        print(red("    Enter 1, 2, or 3"))
+        print(red("    Enter 1, 2, 3, or 4"))
+
+
+def parse_selection(choice_str, max_count):
+    """Parse '1,3,5-8,A' into a sorted list of 0-based indices."""
+    if choice_str.strip().upper() == "A":
+        return list(range(max_count))
+    indices = set()
+    for part in choice_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            try:
+                start, end = part.split("-", 1)
+                for n in range(int(start), int(end) + 1):
+                    if 1 <= n <= max_count:
+                        indices.add(n - 1)
+            except ValueError:
+                print(yellow(f"    Skipping invalid range: {part}"))
+        elif part.isdigit():
+            n = int(part)
+            if 1 <= n <= max_count:
+                indices.add(n - 1)
+            else:
+                print(yellow(f"    Skipping out-of-range: {part}"))
+        elif part:
+            print(yellow(f"    Skipping invalid: {part}"))
+    return sorted(indices)
 
 
 def ask_dump_output_dir(default_dir):
@@ -842,6 +881,65 @@ def run_dump(host, port, user, pwd, db_name, output_dir):
     return dump_file
 
 
+def run_dump_compressed(host, port, user, pwd, db_name, output_dir):
+    """
+    Dump a database to a compressed .sql.gz file using safe read-only flags.
+    Streams mysqldump stdout through Python gzip (detects errors properly).
+    Returns (file_path, compressed_size) on success, (None, 0) on failure.
+    """
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    gz_file  = os.path.join(output_dir, f"{db_name}_{ts}.sql.gz")
+
+    mysqldump_bin = MYSQL_BINS.get("mysqldump") or "mysqldump"
+    cmd = [
+        mysqldump_bin,
+        f"-u{user}",
+        f"-p{pwd}",
+        f"-h{host}",
+        f"-P{str(port)}",
+        "--single-transaction",     # consistent snapshot, no locks on InnoDB
+        "--quick",                  # row-by-row fetch, no client memory bloat
+        "--lock-tables=false",      # no LOCK TABLES even for MyISAM
+        "--set-gtid-purged=OFF",    # avoid GTID errors on restricted users
+        "--no-tablespaces",         # avoid PROCESS privilege requirement
+        db_name,
+    ]
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with gzip.open(gz_file, "wb", compresslevel=6) as gz:
+            while True:
+                chunk = proc.stdout.read(65536)  # 64KB chunks
+                if not chunk:
+                    break
+                gz.write(chunk)
+
+        proc.wait()
+        stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
+
+        if proc.returncode != 0:
+            # Filter out harmless warnings
+            if "Warning" in stderr or "warning" in stderr:
+                pass  # warnings are OK
+            else:
+                # Real error — clean up partial file
+                if os.path.isfile(gz_file):
+                    os.remove(gz_file)
+                return None, stderr
+
+        if not os.path.isfile(gz_file):
+            return None, "Dump file was not created"
+
+        size = os.path.getsize(gz_file)
+        return gz_file, size
+
+    except Exception as e:
+        # Clean up partial file on any error
+        if os.path.isfile(gz_file):
+            os.remove(gz_file)
+        return None, str(e)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIRM SCREEN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -908,6 +1006,121 @@ def flow_dump_only(host, port, user, pwd, dump_available):
     return dump_file
 
 
+def flow_selective_backup(host, port, user, pwd, dump_available):
+    """Mode 4: Selective database backup with .sql.gz compression."""
+    if not dump_available:
+        print(red("  ✗ mysqldump is not installed. Cannot take backups."))
+        sys.exit(1)
+
+    print(bold("\n── Selective database backup ───────────────────────────────"))
+    print(dim("  Safe mode: read-only, no locks on the server\n"))
+
+    # Connect and list databases with sizes
+    conn, _ = connect_mysql(host, port, user, pwd)
+    if not conn:
+        sys.exit(1)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT table_schema, "
+        "  COALESCE(SUM(data_length + index_length), 0) AS size_bytes "
+        "FROM information_schema.tables "
+        "WHERE table_schema NOT IN "
+        "  ('information_schema','performance_schema','mysql','sys') "
+        "GROUP BY table_schema "
+        "ORDER BY table_schema"
+    )
+    db_list = [(row[0], int(row[1])) for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    if not db_list:
+        print(yellow("  No user databases found."))
+        return []
+
+    # Display numbered list with sizes
+    for i, (name, size) in enumerate(db_list, 1):
+        print(f"    {cyan(str(i)):>6}  {name:<35} {dim(f'({_format_size(size)})')}")
+    print(f"    {cyan('A'):>6}  All databases")
+    print()
+
+    # Selection
+    choice = _prompt("Select databases (numbers, ranges 1-3, or A for all)", default="A")
+    selected_idx = parse_selection(choice, len(db_list))
+    if not selected_idx:
+        print(yellow("  No databases selected."))
+        return []
+
+    selected = [db_list[i] for i in selected_idx]
+    total_est = sum(s for _, s in selected)
+
+    # Output directory
+    dump_dir = ask_dump_output_dir(os.path.join(os.path.expanduser("~"), "mysql_backups"))
+
+    # Confirm
+    print(bold("\n── Backup summary ─────────────────────────────────────────"))
+    print(f"  {cyan('Server:')}     {host}")
+    print(f"  {cyan('Databases:')}  {len(selected)}")
+    for name, size in selected:
+        print(f"    - {name}  {dim(f'(~{_format_size(size)})')}")
+    print(f"  {cyan('Est. size:')}  ~{_format_size(total_est)}  {dim('(uncompressed)')}")
+    print(f"  {cyan('Output:')}     {dump_dir}")
+    print(f"  {cyan('Format:')}     .sql.gz  {dim('(gzip compressed)')}")
+    print(f"  {cyan('Safety:')}     {dim('--single-transaction --quick --lock-tables=false')}")
+    print()
+    ans = _prompt("Proceed with backup?", default="yes")
+    if ans.lower() not in ("y", "yes"):
+        print(yellow("  Aborted."))
+        return []
+
+    # Dump loop
+    print(bold("\n── Backing up ─────────────────────────────────────────────"))
+    results  = []   # (db_name, file_path, size)
+    failures = []   # (db_name, error)
+    current_gz = None
+
+    try:
+        for i, (db_name, _) in enumerate(selected, 1):
+            print(f"  Dumping {i}/{len(selected)}: {bold(db_name)}...", end=" ", flush=True)
+            current_gz = os.path.join(dump_dir,
+                f"{db_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql.gz")
+
+            gz_path, result = run_dump_compressed(host, port, user, pwd, db_name, dump_dir)
+            current_gz = None  # no longer in-progress
+
+            if gz_path:
+                print(green("done") + f"  {dim(f'({_format_size(result)})')}")
+                results.append((db_name, gz_path, result))
+            else:
+                print(red("failed"))
+                print(red(f"    {result}"))
+                failures.append((db_name, result))
+
+    except KeyboardInterrupt:
+        print(f"\n\n{yellow('  Interrupted — cleaning up...')}")
+        if current_gz and os.path.isfile(current_gz):
+            os.remove(current_gz)
+            print(dim(f"    Removed partial: {current_gz}"))
+
+    # Summary
+    print(bold(f"\n{'═'*60}"))
+    if results:
+        total_compressed = sum(s for _, _, s in results)
+        print(green("  ✅  Backup complete!"))
+        print(f"  {cyan('Output:')}  {dump_dir}")
+        for db_name, gz_path, size in results:
+            fname = os.path.basename(gz_path)
+            print(f"    {fname:<50} {dim(_format_size(size))}")
+        print(f"  {cyan('Total:')}   {_format_size(total_compressed)} compressed")
+    if failures:
+        print(yellow(f"\n  ⚠  {len(failures)} database(s) failed:"))
+        for db_name, err in failures:
+            print(f"    {red(db_name)}: {err}")
+    if not results and not failures:
+        print(yellow("  No backups completed."))
+    print(bold(f"{'═'*60}\n"))
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -924,13 +1137,10 @@ def main():
     _, dump_available = preflight()
     import pandas as pd
 
-    # 2. Mode selection (before asking for file, so dump-only skips file prompt)
-    mode = ask_mode(dump_available)
-
-    # 3. Connection details (needed for all modes)
+    # 2. Connection details (ask first — all modes need it, and mode 4 needs is_remote)
     host, port, user, pwd = ask_connection()
 
-    # 4. Remote server warning
+    # 3. Remote server warning
     is_remote = host not in ("127.0.0.1", "localhost", "::1")
     if is_remote:
         print()
@@ -943,13 +1153,16 @@ def main():
             print(yellow("  Aborted."))
             return
 
-    # 5. Quick connectivity test (with password retry on typo)
+    # 4. Quick connectivity test (with password retry on typo)
     print(f"\n  {dim('Testing connection...')}")
     test_conn, pwd = connect_mysql(host, port, user, pwd, retry_password=True)
     if not test_conn:
         sys.exit(1)
     test_conn.close()
     print(green("  ✓ Connected to MySQL") + (f"  ({host})" if is_remote else ""))
+
+    # 5. Mode selection (after connection — mode 4 highlights "recommended" for remote)
+    mode = ask_mode(dump_available, is_remote=is_remote)
 
     # ── DUMP ONLY ─────────────────────────────────────────────────────────────
     if mode == "3":
@@ -960,6 +1173,11 @@ def main():
         else:
             print(red("  ✗  Dump failed."))
         print(bold(f"{'═'*60}\n"))
+        return
+
+    # ── SELECTIVE BACKUP ──────────────────────────────────────────────────────
+    if mode == "4":
+        flow_selective_backup(host, port, user, pwd, dump_available)
         return
 
     # ── LOAD (modes 1 & 2) ────────────────────────────────────────────────────
