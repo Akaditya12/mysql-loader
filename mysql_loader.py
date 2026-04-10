@@ -1128,6 +1128,43 @@ def flow_selective_backup(host, port, user, pwd, dump_available):
     return results
 
 
+def _peek_dump_database(path):
+    """
+    Peek into a .sql or .sql.gz file to find the embedded database name.
+    Returns the database name from the first USE `dbname` statement, or None.
+    """
+    try:
+        if path.endswith(".sql.gz"):
+            f = gzip.open(path, "rb")
+        else:
+            f = open(path, "rb")
+        with f:
+            head = f.read(8192).decode("utf-8", errors="replace")
+        for line in head.splitlines():
+            line = line.strip()
+            match = re.match(r'^USE\s+`([^`]+)`', line, re.IGNORECASE)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _rewrite_db_in_stream(data, old_db, new_db):
+    """Replace database references in a SQL dump chunk (bytes)."""
+    old_use    = f"USE `{old_db}`".encode()
+    new_use    = f"USE `{new_db}`".encode()
+    old_create = f"`{old_db}`".encode()
+    new_create = f"`{new_db}`".encode()
+    data = data.replace(old_use, new_use)
+    # Only replace CREATE DATABASE lines (not random occurrences in data)
+    data = data.replace(
+        f"CREATE DATABASE".encode() + b" /*!32312 IF NOT EXISTS*/ " + old_create,
+        f"CREATE DATABASE".encode() + b" /*!32312 IF NOT EXISTS*/ " + new_create,
+    )
+    return data
+
+
 def flow_restore_sql(host, port, user, pwd):
     """Mode 5: Restore a .sql or .sql.gz dump file into MySQL."""
     mysql_bin = MYSQL_BINS.get("mysql")
@@ -1160,6 +1197,11 @@ def flow_restore_sql(host, port, user, pwd):
     print(f"  {dim('Size:')}   {_format_size(file_size)}" +
           (f"  {dim('(gzip compressed)')}" if is_gz else ""))
 
+    # Peek for embedded database name
+    embedded_db = _peek_dump_database(path)
+    if embedded_db:
+        print(f"  {dim('Embedded DB:')} {cyan(embedded_db)}  {dim('(found inside the dump)')}")
+
     # List existing databases and ask target
     conn, _ = connect_mysql(host, port, user, pwd)
     if not conn:
@@ -1177,19 +1219,26 @@ def flow_restore_sql(host, port, user, pwd):
     if existing_dbs:
         print(f"  {dim('Existing databases:')}  " + "  ".join(cyan(d) for d in existing_dbs))
 
-    # Derive default DB name from filename
-    base = os.path.basename(path)
-    if base.endswith(".sql.gz"):
-        base = base[:-7]
-    elif base.endswith(".sql"):
-        base = base[:-4]
-    # Strip timestamp patterns like _20260408_183219
-    base = re.sub(r'_\d{8}_\d{6}$', '', base)
-    safe_default = re.sub(r'[^a-z0-9]', '_', base.lower()).strip('_') or "restore_db"
+    # Derive default DB name: prefer embedded name, then filename
+    if embedded_db:
+        safe_default = embedded_db
+    else:
+        base = os.path.basename(path)
+        if base.endswith(".sql.gz"):
+            base = base[:-7]
+        elif base.endswith(".sql"):
+            base = base[:-4]
+        base = re.sub(r'_\d{8}_\d{6}$', '', base)
+        safe_default = re.sub(r'[^a-z0-9]', '_', base.lower()).strip('_') or "restore_db"
 
     print()
     db_name = _prompt("Target database", default=safe_default)
     is_remote = host not in ("127.0.0.1", "localhost", "::1")
+
+    # Detect if we need to rewrite the embedded DB name
+    needs_rewrite = embedded_db and embedded_db != db_name
+    if needs_rewrite:
+        print(f"  {dim('Will rewrite')} USE `{embedded_db}` → USE `{db_name}` {dim('in the SQL stream')}")
 
     # Check if DB exists
     create_db = True
@@ -1197,9 +1246,9 @@ def flow_restore_sql(host, port, user, pwd):
         print(f"\n  {yellow('⚠')} Database {bold(db_name)} already exists")
         ans = _prompt("  Drop and recreate it? (yes = fresh restore, no = restore into existing)", default="no")
         if ans.lower() in ("y", "yes"):
-            create_db = True  # will drop + create
+            create_db = True
         else:
-            create_db = False  # restore into existing DB
+            create_db = False
 
     # Confirm
     host_str = f"{host}:{port}"
@@ -1211,6 +1260,8 @@ def flow_restore_sql(host, port, user, pwd):
     print(f"  {cyan('Database:')}  {db_name}" +
           (f"  {dim('(drop & recreate)')}" if create_db and db_name in existing_dbs else
            f"  {dim('(new)')}" if create_db else f"  {dim('(into existing)')}"))
+    if needs_rewrite:
+        print(f"  {cyan('Rewrite:')}   {embedded_db} → {db_name}")
     print(f"  {cyan('Host:')}      {host_str}")
     print()
     ans = _prompt("Proceed with restore?", default="yes")
@@ -1236,7 +1287,7 @@ def flow_restore_sql(host, port, user, pwd):
     cur.close()
     conn.close()
 
-    # Build mysql command
+    # Build mysql command (don't pass db name — we handle it in the SQL stream)
     cmd = [
         mysql_bin,
         f"-u{user}",
@@ -1246,28 +1297,30 @@ def flow_restore_sql(host, port, user, pwd):
         db_name,
     ]
 
-    # Execute: pipe file (or decompressed stream) into mysql client
+    # Execute: pipe file through stream, rewriting DB name if needed
     print(f"  Restoring {bold(os.path.basename(path))} into {bold(db_name)}...", end=" ", flush=True)
     t_start = time.time()
 
     try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
         if is_gz:
-            # Decompress on the fly and pipe to mysql
-            with gzip.open(path, "rb") as gz:
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-                while True:
-                    chunk = gz.read(65536)
-                    if not chunk:
-                        break
-                    proc.stdin.write(chunk)
-                proc.stdin.close()
-                proc.wait()
-                stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
+            source = gzip.open(path, "rb")
         else:
-            with open(path, "rb") as f:
-                proc = subprocess.Popen(cmd, stdin=f, stderr=subprocess.PIPE)
-                proc.wait()
-                stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
+            source = open(path, "rb")
+
+        with source:
+            while True:
+                chunk = source.read(65536)
+                if not chunk:
+                    break
+                if needs_rewrite:
+                    chunk = _rewrite_db_in_stream(chunk, embedded_db, db_name)
+                proc.stdin.write(chunk)
+
+        proc.stdin.close()
+        proc.wait()
+        stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
 
     except Exception as e:
         print(red(f"failed\n  ✗ {e}"))
@@ -1276,7 +1329,6 @@ def flow_restore_sql(host, port, user, pwd):
     elapsed = time.time() - t_start
 
     if proc.returncode != 0:
-        # Filter warnings vs real errors
         if stderr and not all(
             "warning" in line.lower() for line in stderr.splitlines() if line.strip()
         ):
