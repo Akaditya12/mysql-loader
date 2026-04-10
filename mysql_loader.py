@@ -490,28 +490,35 @@ def ask_db_table(filename, host=None, port=None, user=None, pwd=None):
     return db, table
 
 
-def ask_mode(dump_available, is_remote=False):
+def ask_mode(dump_available, is_remote=False, mysql_client_ok=True):
     print(bold("\n── What would you like to do? ──────────────────────────────"))
-    print(f"  {cyan('1')}  Load file into MySQL only")
+    print(f"  {cyan('1')}  Load CSV / TSV / Excel into MySQL")
     if dump_available:
         print(f"  {cyan('2')}  Load file into MySQL  +  take .sql dump")
-        print(f"  {cyan('3')}  Take .sql dump of an existing database (no file needed)")
+        print(f"  {cyan('3')}  Take .sql dump of an existing database")
         remote_hint = f"  {yellow('← recommended for remote')}" if is_remote else ""
         print(f"  {cyan('4')}  Backup databases (selective, compressed .sql.gz){remote_hint}")
     else:
         print(dim("  2  Load + Dump  (mysqldump not available)"))
         print(dim("  3  Dump only    (mysqldump not available)"))
         print(dim("  4  Backup       (mysqldump not available)"))
+    if mysql_client_ok:
+        print(f"  {cyan('5')}  Restore a .sql / .sql.gz dump into MySQL")
+    else:
+        print(dim("  5  Restore .sql  (mysql client not available)"))
     print()
     default = "4" if is_remote and dump_available else ("2" if dump_available else "1")
     while True:
         choice = _prompt("Choice", default=default)
-        if choice in ("1", "2", "3", "4"):
+        if choice in ("1", "2", "3", "4", "5"):
             if choice in ("2", "3", "4") and not dump_available:
-                print(yellow("    mysqldump is not installed — only option 1 is available."))
-                choice = "1"
+                print(yellow("    mysqldump is not installed — pick another option."))
+                continue
+            if choice == "5" and not mysql_client_ok:
+                print(yellow("    mysql client is not installed — pick another option."))
+                continue
             return choice
-        print(red("    Enter 1, 2, 3, or 4"))
+        print(red("    Enter 1, 2, 3, 4, or 5"))
 
 
 def parse_selection(choice_str, max_count):
@@ -1121,6 +1128,190 @@ def flow_selective_backup(host, port, user, pwd, dump_available):
     return results
 
 
+def flow_restore_sql(host, port, user, pwd):
+    """Mode 5: Restore a .sql or .sql.gz dump file into MySQL."""
+    mysql_bin = MYSQL_BINS.get("mysql")
+    if not mysql_bin:
+        print(red("  ✗ mysql client is not installed. Cannot restore."))
+        sys.exit(1)
+
+    print(bold("\n── Restore SQL dump ────────────────────────────────────────"))
+    print(dim("  Supported: .sql  .sql.gz"))
+    print(dim("  Tip: drag & drop the file into the terminal\n"))
+
+    # Ask for file
+    while True:
+        path = _prompt("SQL file path", required=True)
+        path = os.path.expanduser(path.strip("'\""))
+        if not os.path.isfile(path):
+            print(red(f"    File not found: {path}"))
+            continue
+        ext = os.path.splitext(path)[1].lower()
+        if path.endswith(".sql.gz"):
+            ext = ".sql.gz"
+        if ext not in (".sql", ".sql.gz"):
+            print(red(f"    Unsupported type '{ext}' — use .sql or .sql.gz"))
+            continue
+        break
+
+    is_gz     = path.endswith(".sql.gz")
+    file_size = os.path.getsize(path)
+    print(f"\n  {dim('File:')}   {os.path.basename(path)}")
+    print(f"  {dim('Size:')}   {_format_size(file_size)}" +
+          (f"  {dim('(gzip compressed)')}" if is_gz else ""))
+
+    # List existing databases and ask target
+    conn, _ = connect_mysql(host, port, user, pwd)
+    if not conn:
+        sys.exit(1)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT schema_name FROM information_schema.schemata "
+        "WHERE schema_name NOT IN "
+        "('information_schema','performance_schema','mysql','sys')"
+    )
+    existing_dbs = [row[0] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    if existing_dbs:
+        print(f"  {dim('Existing databases:')}  " + "  ".join(cyan(d) for d in existing_dbs))
+
+    # Derive default DB name from filename
+    base = os.path.basename(path)
+    if base.endswith(".sql.gz"):
+        base = base[:-7]
+    elif base.endswith(".sql"):
+        base = base[:-4]
+    # Strip timestamp patterns like _20260408_183219
+    base = re.sub(r'_\d{8}_\d{6}$', '', base)
+    safe_default = re.sub(r'[^a-z0-9]', '_', base.lower()).strip('_') or "restore_db"
+
+    print()
+    db_name = _prompt("Target database", default=safe_default)
+    is_remote = host not in ("127.0.0.1", "localhost", "::1")
+
+    # Check if DB exists
+    create_db = True
+    if db_name in existing_dbs:
+        print(f"\n  {yellow('⚠')} Database {bold(db_name)} already exists")
+        ans = _prompt("  Drop and recreate it? (yes = fresh restore, no = restore into existing)", default="no")
+        if ans.lower() in ("y", "yes"):
+            create_db = True  # will drop + create
+        else:
+            create_db = False  # restore into existing DB
+
+    # Confirm
+    host_str = f"{host}:{port}"
+    if is_remote:
+        host_str = yellow(f"{host_str}  ⚠ REMOTE SERVER")
+
+    print(bold("\n── Restore summary ────────────────────────────────────────"))
+    print(f"  {cyan('File:')}      {os.path.basename(path)}  {dim(f'({_format_size(file_size)})')}")
+    print(f"  {cyan('Database:')}  {db_name}" +
+          (f"  {dim('(drop & recreate)')}" if create_db and db_name in existing_dbs else
+           f"  {dim('(new)')}" if create_db else f"  {dim('(into existing)')}"))
+    print(f"  {cyan('Host:')}      {host_str}")
+    print()
+    ans = _prompt("Proceed with restore?", default="yes")
+    if ans.lower() not in ("y", "yes"):
+        print(yellow("  Aborted."))
+        return None
+
+    # Create/recreate database if needed
+    print(bold("\n── Restoring ──────────────────────────────────────────────"))
+    conn, _ = connect_mysql(host, port, user, pwd)
+    if not conn:
+        sys.exit(1)
+    cur = conn.cursor()
+    if create_db:
+        if db_name in existing_dbs:
+            cur.execute(f"DROP DATABASE `{db_name}`")
+        cur.execute(
+            f"CREATE DATABASE `{db_name}` "
+            f"CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        )
+        print(f"  {green('✓')} Database {bold(db_name)} created")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    # Build mysql command
+    cmd = [
+        mysql_bin,
+        f"-u{user}",
+        f"-p{pwd}",
+        f"-h{host}",
+        f"-P{str(port)}",
+        db_name,
+    ]
+
+    # Execute: pipe file (or decompressed stream) into mysql client
+    print(f"  Restoring {bold(os.path.basename(path))} into {bold(db_name)}...", end=" ", flush=True)
+    t_start = time.time()
+
+    try:
+        if is_gz:
+            # Decompress on the fly and pipe to mysql
+            with gzip.open(path, "rb") as gz:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                while True:
+                    chunk = gz.read(65536)
+                    if not chunk:
+                        break
+                    proc.stdin.write(chunk)
+                proc.stdin.close()
+                proc.wait()
+                stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
+        else:
+            with open(path, "rb") as f:
+                proc = subprocess.Popen(cmd, stdin=f, stderr=subprocess.PIPE)
+                proc.wait()
+                stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
+
+    except Exception as e:
+        print(red(f"failed\n  ✗ {e}"))
+        return None
+
+    elapsed = time.time() - t_start
+
+    if proc.returncode != 0:
+        # Filter warnings vs real errors
+        if stderr and not all(
+            "warning" in line.lower() for line in stderr.splitlines() if line.strip()
+        ):
+            print(red("failed"))
+            print(red(f"  ✗ mysql error: {stderr}"))
+            return None
+
+    if stderr and ("warning" in stderr.lower()):
+        print(green("done") + f"  {dim(f'({elapsed:.1f}s)')}")
+        print(yellow(f"  ⚠  {stderr}"))
+    else:
+        print(green("done") + f"  {dim(f'({elapsed:.1f}s)')}")
+
+    # Verify: count tables
+    conn, _ = connect_mysql(host, port, user, pwd, db=db_name)
+    if conn:
+        cur = conn.cursor()
+        cur.execute("SHOW TABLES")
+        tables = [row[0] for row in cur.fetchall()]
+        cur.close()
+        conn.close()
+        print(f"  {green('✓')} Restored {bold(str(len(tables)))} tables into {bold(db_name)}")
+        if len(tables) <= 20:
+            print(f"  {dim('Tables:')}  " + "  ".join(cyan(t) for t in tables))
+
+    # Final summary
+    print(bold(f"\n{'═'*60}"))
+    print(green("  ✅  Restore complete!"))
+    print(f"  {cyan('Database:')}  {db_name}")
+    print(f"  {cyan('Source:')}    {os.path.basename(path)}")
+    print(f"  {cyan('Time:')}      {elapsed:.1f}s")
+    print(bold(f"{'═'*60}\n"))
+    return db_name
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1134,7 +1325,7 @@ def main():
         return
 
     # 1. Pre-flight (installs packages if missing, so import pandas after this)
-    _, dump_available = preflight()
+    mysql_ok, dump_available = preflight()
     import pandas as pd
 
     # 2. Connection details (ask first — all modes need it, and mode 4 needs is_remote)
@@ -1162,7 +1353,12 @@ def main():
     print(green("  ✓ Connected to MySQL") + (f"  ({host})" if is_remote else ""))
 
     # 5. Mode selection (after connection — mode 4 highlights "recommended" for remote)
-    mode = ask_mode(dump_available, is_remote=is_remote)
+    mode = ask_mode(dump_available, is_remote=is_remote, mysql_client_ok=mysql_ok)
+
+    # ── RESTORE SQL ───────────────────────────────────────────────────────────
+    if mode == "5":
+        flow_restore_sql(host, port, user, pwd)
+        return
 
     # ── DUMP ONLY ─────────────────────────────────────────────────────────────
     if mode == "3":
