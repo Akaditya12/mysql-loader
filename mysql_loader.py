@@ -865,7 +865,11 @@ def run_dump(host, port, user, pwd, db_name, output_dir):
         f"-p{pwd}",
         f"-h{host}",
         f"-P{str(port)}",
-        "--no-tablespaces",
+        "--no-tablespaces",         # no PROCESS privilege needed
+        "--set-gtid-purged=OFF",    # no SUPER privilege needed (RDS safe)
+        "--no-create-db",           # skip CREATE DATABASE (portable across targets)
+        "--single-transaction",     # consistent snapshot, no locks on InnoDB
+        "--quick",                  # row-by-row fetch, low memory
         "--result-file", dump_file,
         db_name,
     ]
@@ -907,8 +911,9 @@ def run_dump_compressed(host, port, user, pwd, db_name, output_dir):
         "--single-transaction",     # consistent snapshot, no locks on InnoDB
         "--quick",                  # row-by-row fetch, no client memory bloat
         "--lock-tables=false",      # no LOCK TABLES even for MyISAM
-        "--set-gtid-purged=OFF",    # avoid GTID errors on restricted users
-        "--no-tablespaces",         # avoid PROCESS privilege requirement
+        "--set-gtid-purged=OFF",    # no SUPER privilege needed (RDS safe)
+        "--no-tablespaces",         # no PROCESS privilege needed
+        "--no-create-db",           # skip CREATE DATABASE (portable across targets)
         db_name,
     ]
 
