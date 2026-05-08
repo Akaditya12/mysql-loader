@@ -1155,6 +1155,23 @@ def _peek_dump_database(path):
     return None
 
 
+def _sanitize_dump_stream(data):
+    """
+    Strip privileged statements from a SQL dump chunk that require
+    SUPER / SYSTEM_VARIABLES_ADMIN and break on RDS / managed MySQL.
+    """
+    lines = data.split(b"\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith(b"SET @@GLOBAL.GTID_PURGED"):
+            continue
+        if stripped.startswith(b"SET @@SESSION.SQL_LOG_BIN"):
+            continue
+        cleaned.append(line)
+    return b"\n".join(cleaned)
+
+
 def _rewrite_db_in_stream(data, old_db, new_db):
     """Replace database references in a SQL dump chunk (bytes)."""
     old_use    = f"USE `{old_db}`".encode()
@@ -1319,6 +1336,7 @@ def flow_restore_sql(host, port, user, pwd):
                 chunk = source.read(65536)
                 if not chunk:
                     break
+                chunk = _sanitize_dump_stream(chunk)
                 if needs_rewrite:
                     chunk = _rewrite_db_in_stream(chunk, embedded_db, db_name)
                 proc.stdin.write(chunk)
